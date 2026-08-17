@@ -41,6 +41,8 @@ body {
 }
 a { color: inherit; text-decoration: none; }
 button { font-family: inherit; cursor: pointer; }
+/* tamanho padrão dos ícones SVG (seletores mais específicos sobrescrevem) */
+.ico { width: 16px; height: 16px; flex: 0 0 auto; }
 
 /* ==========================================================================
    Layout
