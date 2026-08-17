@@ -50,9 +50,23 @@ async function enviarMock() {
 const evoUrl = (path) => `${EVOLUTION_API_URL.replace(/\/$/, '')}${path}`;
 const evoHeaders = (extra = {}) => ({ apikey: EVOLUTION_API_KEY, 'Content-Type': 'application/json', ...extra });
 
+// fetch com timeout (evita travar se a Evolution não responder).
+async function evoFetch(url, opts = {}, ms = 25000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Evolution não respondeu (timeout).');
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 /** Estado da conexão da instância: 'open' | 'connecting' | 'close' | 'inexistente'. */
 export async function evolutionState(instance) {
-  const res = await fetch(evoUrl(`/instance/connectionState/${instance}`), { headers: evoHeaders() });
+  const res = await evoFetch(evoUrl(`/instance/connectionState/${instance}`), { headers: evoHeaders() });
   if (res.status === 404) return 'inexistente';
   if (!res.ok) throw new Error(`Evolution respondeu ${res.status}`);
   const data = await res.json().catch(() => ({}));
@@ -61,7 +75,7 @@ export async function evolutionState(instance) {
 
 /** Cria a instância se ainda não existir (ignora "já existe"). */
 export async function evolutionCreateInstance(instance) {
-  const res = await fetch(evoUrl('/instance/create'), {
+  const res = await evoFetch(evoUrl('/instance/create'), {
     method: 'POST',
     headers: evoHeaders(),
     body: JSON.stringify({ instanceName: instance, integration: 'WHATSAPP-BAILEYS', qrcode: true }),
@@ -80,7 +94,7 @@ export async function evolutionConnect(instance) {
     const criado = await evolutionCreateInstance(instance);
     if (criado?.base64) return criado; // create já devolve QR
   }
-  const res = await fetch(evoUrl(`/instance/connect/${instance}`), { headers: evoHeaders() });
+  const res = await evoFetch(evoUrl(`/instance/connect/${instance}`), { headers: evoHeaders() });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);
   return { base64: data?.base64 || null, code: data?.code || null, pairingCode: data?.pairingCode || null };
@@ -88,7 +102,7 @@ export async function evolutionConnect(instance) {
 
 /** Desconecta o WhatsApp da instância (logout). */
 export async function evolutionLogout(instance) {
-  const res = await fetch(evoUrl(`/instance/logout/${instance}`), { method: 'DELETE', headers: evoHeaders() });
+  const res = await evoFetch(evoUrl(`/instance/logout/${instance}`), { method: 'DELETE', headers: evoHeaders() });
   if (!res.ok && res.status !== 404) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data?.message || `HTTP ${res.status}`);
@@ -97,7 +111,7 @@ export async function evolutionLogout(instance) {
 }
 
 async function evolutionSendText(instance, number, text) {
-  const res = await fetch(evoUrl(`/message/sendText/${instance}`), {
+  const res = await evoFetch(evoUrl(`/message/sendText/${instance}`), {
     method: 'POST', headers: evoHeaders(), body: JSON.stringify({ number, text }),
   });
   const data = await res.json().catch(() => ({}));
@@ -107,7 +121,7 @@ async function evolutionSendText(instance, number, text) {
 
 async function evolutionSendMedia(instance, number, { caminho, nome_arquivo, mime_type }, caption) {
   const buffer = await readFile(caminho);
-  const res = await fetch(evoUrl(`/message/sendMedia/${instance}`), {
+  const res = await evoFetch(evoUrl(`/message/sendMedia/${instance}`), {
     method: 'POST', headers: evoHeaders(),
     body: JSON.stringify({
       number, mediatype: mediatypeFor(mime_type), mimetype: mime_type || 'application/octet-stream',

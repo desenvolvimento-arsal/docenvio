@@ -6,6 +6,7 @@ const ROUTES = {
   rapido: { title: 'Envio Rápido', render: renderEnvioRapido },
   dashboard: { title: 'Dashboard', render: renderDashboard },
   envio: { title: 'Envio de Guias', render: renderEnvio },
+  agendamentos: { title: 'Agendamentos', render: renderAgendamentos },
   clientes: { title: 'Clientes', render: renderClientes },
   documentos: { title: 'Guias & Boletos', render: renderDocumentos },
   whatsapp: { title: 'Conexão WhatsApp', render: renderWhatsapp },
@@ -13,6 +14,30 @@ const ROUTES = {
   'tipos-pagamento': { title: 'Formas de Pagamento', render: () => renderTipos('tipos-pagamento', 'Forma de Pagamento') },
   admin: { title: 'Contas', render: renderAdmin },
 };
+
+// ---- agendamento: bloco reutilizável nos fluxos de envio ----
+function schedBlock(prefix) {
+  return `<div style="margin:4px 0 12px">
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text-2)">
+      <input type="checkbox" id="${prefix}-agchk" style="width:16px;height:16px;accent-color:var(--primary)"> ${icon('clock')} Agendar para depois
+    </label>
+    <input type="datetime-local" id="${prefix}-agdt" class="filter" style="width:100%;margin-top:8px;display:none">
+  </div>`;
+}
+// Liga o bloco; atualiza o label do botão. Retorna helpers { agendado, quando, valido }.
+function wireSched(prefix, root, btn, labelNormal) {
+  const chk = root.querySelector('#' + prefix + '-agchk');
+  const dt = root.querySelector('#' + prefix + '-agdt');
+  if (chk) chk.onchange = () => {
+    dt.style.display = chk.checked ? 'block' : 'none';
+    if (btn) btn.innerHTML = chk.checked ? `${icon('clock')} Agendar envio` : labelNormal;
+  };
+  return {
+    agendado: () => chk && chk.checked,
+    valido: () => dt.value && new Date(dt.value).getTime() > Date.now(),
+    quando: () => new Date(dt.value).toISOString(),
+  };
+}
 
 // ---- helpers de formatação (compartilhados) ----
 const FMT = {
@@ -28,6 +53,7 @@ function navigate(route) {
 
 async function router() {
   if (window._waPoll) { clearInterval(window._waPoll); window._waPoll = null; } // para polling do QR ao sair
+  if (window._agPoll) { clearInterval(window._agPoll); window._agPoll = null; }
   const hash = location.hash.replace('#', '') || 'rapido';
   view.innerHTML = '<div class="empty">Carregando…</div>';
 
@@ -619,6 +645,7 @@ function renderEnvioIndividual(alunos, root, msgPadrao) {
           <textarea id="e-msg" rows="6">${msgPadrao}</textarea>
           <div class="mono-count"><span id="e-count">0</span> caracteres · use {{nome}}, {{competencia}} e {{lista}}</div>
         </div>
+        ${schedBlock('e')}
         <button class="btn success block" id="e-enviar" disabled>${icon('send')} Enviar via WhatsApp</button>
       </div>
       <div class="wa-preview">
@@ -684,20 +711,25 @@ function renderEnvioIndividual(alunos, root, msgPadrao) {
     await loadDocs();
   };
   $('e-msg').oninput = updatePreview;
+  const sched = wireSched('e', root, $('e-enviar'), `${icon('send')} Enviar via WhatsApp`);
 
   $('e-enviar').onclick = async () => {
     const btn = $('e-enviar');
-    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Enviando…`;
+    if (sched.agendado() && !sched.valido()) return UI.toast('warning', 'Escolha uma data/hora futura');
+    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} ${sched.agendado() ? 'Agendando…' : 'Enviando…'}`;
+    const payload = { cliente_id: state.cliente.id, documento_ids: [...state.selected], mensagem: $('e-msg').value };
     try {
-      const res = await API.post('/enviar', {
-        cliente_id: state.cliente.id,
-        documento_ids: [...state.selected],
-        mensagem: $('e-msg').value,
-      });
-      if (res.falhas === 0) UI.toast('success', 'Envio concluído', `${res.enviados} guia(s) enviada(s).`);
-      else if (res.enviados === 0) UI.toast('error', 'Falha no envio', 'Nenhuma guia foi enviada. Tente novamente.');
-      else UI.toast('warning', 'Envio parcial', `${res.enviados} enviada(s), ${res.falhas} falha(s).`);
-      await loadDocs();
+      if (sched.agendado()) {
+        await API.post('/agendamentos', { tipo: 'individual', payload, quando: sched.quando() });
+        UI.toast('success', 'Envio agendado', `para ${UI.fmtDate(sched.quando())}`);
+        root.querySelector('#e-agchk').checked = false; root.querySelector('#e-agdt').style.display = 'none';
+      } else {
+        const res = await API.post('/enviar', payload);
+        if (res.falhas === 0) UI.toast('success', 'Envio concluído', `${res.enviados} guia(s) enviada(s).`);
+        else if (res.enviados === 0) UI.toast('error', 'Falha no envio', 'Nenhuma guia foi enviada. Tente novamente.');
+        else UI.toast('warning', 'Envio parcial', `${res.enviados} enviada(s), ${res.falhas} falha(s).`);
+        await loadDocs();
+      }
       refreshWaStatus();
     } catch (e) { UI.toast('error', 'Não foi possível enviar', e.message); }
     btn.innerHTML = `${icon('send')} Enviar via WhatsApp`; updateButton();
@@ -737,6 +769,7 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
           <textarea id="m-msg" rows="6">${msgPadrao}</textarea>
           <div class="mono-count">use {{nome}}, {{competencia}} e {{lista}}</div>
         </div>
+        ${schedBlock('m')}
         <button class="btn success block" id="m-enviar" disabled>${icon('send')} Enviar em massa</button>
         <div class="mass-results" id="m-results"></div>
       </div>
@@ -804,7 +837,8 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
   const updateUI = () => {
     $('m-count').textContent = `${selected.size} selecionados`;
     $('m-enviar').disabled = selected.size === 0;
-    $('m-enviar').innerHTML = `${icon('send')} Enviar em massa${selected.size ? ` (${selected.size})` : ''}`;
+    const ag = root.querySelector('#m-agchk') && root.querySelector('#m-agchk').checked;
+    $('m-enviar').innerHTML = `${icon(ag ? 'clock' : 'send')} ${ag ? 'Agendar em massa' : 'Enviar em massa'}${selected.size ? ` (${selected.size})` : ''}`;
     const vis = visiveis().filter((a) => guiasDe(a.id).length > 0);
     $('m-all').checked = vis.length > 0 && vis.every((a) => selected.has(a.id));
     updatePreview();
@@ -817,13 +851,26 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
     renderList(); updateUI();
   };
   $('m-msg').oninput = updatePreview;
+  const sched = wireSched('m', root, null, null);
+  root.querySelector('#m-agchk').addEventListener('change', updateUI);
 
   $('m-enviar').onclick = async () => {
     const btn = $('m-enviar');
+    const payload = { aluno_ids: [...selected], competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value };
+    if (sched.agendado()) {
+      if (!sched.valido()) return UI.toast('warning', 'Escolha uma data/hora futura');
+      btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Agendando…`;
+      try {
+        await API.post('/agendamentos', { tipo: 'massa', payload, quando: sched.quando() });
+        UI.toast('success', 'Envio em massa agendado', `${selected.size} cliente(s) · ${UI.fmtDate(sched.quando())}`);
+        root.querySelector('#m-agchk').checked = false; root.querySelector('#m-agdt').style.display = 'none'; root.querySelector('#m-agdt').value = '';
+      } catch (e) { UI.toast('error', 'Não foi possível agendar', e.message); }
+      btn.disabled = false; updateUI(); return;
+    }
     btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Enviando para ${selected.size} cliente(s)…`;
     $('m-results').innerHTML = '';
     try {
-      const res = await API.post('/enviar-massa', { aluno_ids: [...selected], competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value });
+      const res = await API.post('/enviar-massa', payload);
       if (res.falhas === 0 && res.enviados > 0) UI.toast('success', 'Envio em massa concluído', `${res.enviados} guia(s) para ${res.alunos} cliente(s).`);
       else if (res.enviados === 0) UI.toast('error', 'Nenhum envio realizado', 'Verifique a conexão do WhatsApp.');
       else UI.toast('warning', 'Envio parcial', `${res.enviados} enviada(s), ${res.falhas} falha(s).`);
@@ -892,6 +939,7 @@ async function renderEnvioRapido() {
           <textarea id="r-msg" rows="6">${TEMPLATES_RAPIDO[0].texto}</textarea>
           <div class="mono-count">use {{nome}}, {{competencia}} e {{lista}}</div>
         </div>
+        ${schedBlock('r')}
         <button class="btn success block" id="r-enviar" disabled>${icon('send')} Enviar via WhatsApp</button>
       </div>
       <div class="wa-preview">
@@ -947,6 +995,7 @@ async function renderEnvioRapido() {
   $('r-nome').oninput = update; $('r-comp').onchange = update; $('r-msg').oninput = update;
   UI.bindMask($('r-tel'), UI.maskPhone); $('r-tel').addEventListener('input', update);
   $('r-tpl').onchange = () => { $('r-msg').value = TEMPLATES_RAPIDO[Number($('r-tpl').value)].texto; update(); };
+  const sched = wireSched('r', document, $('r-enviar'), `${icon('send')} Enviar via WhatsApp`);
 
   const dz = $('r-dz'), fileInput = $('r-file');
   const addFiles = (list) => { files = files.concat([...list]); renderChips(); update(); };
@@ -958,7 +1007,8 @@ async function renderEnvioRapido() {
 
   $('r-enviar').onclick = async () => {
     const btn = $('r-enviar');
-    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Enviando…`;
+    if (sched.agendado() && !sched.valido()) return UI.toast('warning', 'Escolha uma data/hora futura');
+    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} ${sched.agendado() ? 'Agendando…' : 'Enviando…'}`;
     try {
       let c = clienteAtual();
       // 1) cria o cliente se for novo
@@ -966,7 +1016,7 @@ async function renderEnvioRapido() {
         const novo = await API.post('/clientes', { nome: c.nome, telefone: c.telefone });
         c = { ...novo, novo: false };
       }
-      // 2) sobe os documentos
+      // 2) sobe os documentos (agora, mesmo que o envio seja agendado)
       const comp = $('r-comp').value;
       const ids = [];
       for (const f of files) {
@@ -976,21 +1026,68 @@ async function renderEnvioRapido() {
         const doc = await API.upload('/documentos', fd);
         ids.push(doc.id);
       }
-      // 3) envia
-      const res = await API.post('/enviar', { cliente_id: c.id, documento_ids: ids, mensagem: $('r-msg').value });
-      if (res.falhas === 0) UI.toast('success', 'Enviado!', `${res.enviados} envio(s) para ${c.nome}.`);
-      else UI.toast('error', 'Falha no envio', 'Verifique a conexão do WhatsApp e tente novamente.');
+      // 3) envia agora OU agenda
+      const payload = { cliente_id: c.id, documento_ids: ids, mensagem: $('r-msg').value };
+      if (sched.agendado()) {
+        await API.post('/agendamentos', { tipo: 'individual', payload, quando: sched.quando() });
+        UI.toast('success', 'Envio agendado', `para ${UI.fmtDate(sched.quando())}`);
+      } else {
+        const res = await API.post('/enviar', payload);
+        if (res.falhas === 0) UI.toast('success', 'Enviado!', `${res.enviados} envio(s) para ${c.nome}.`);
+        else UI.toast('error', 'Falha no envio', 'Verifique a conexão do WhatsApp e tente novamente.');
+      }
       // limpa para o próximo envio
       files = []; renderChips();
       $('r-cli').innerHTML = `<option value="">Selecione um cliente…</option><option value="__novo__">➕ Cadastrar novo cliente</option>` +
         (await API.get('/clientes')).map((x) => `<option value="${x.id}">${UI.esc(x.nome)} — ${UI.esc(x.telefone)}</option>`).join('');
       $('r-novo').hidden = true;
+      $('r-agchk').checked = false; $('r-agdt').style.display = 'none'; $('r-agdt').value = '';
       refreshWaStatus();
     } catch (e) { UI.toast('error', 'Não foi possível enviar', e.message); }
     btn.innerHTML = `${icon('send')} Enviar via WhatsApp`; update();
   };
 
   update();
+}
+
+// ================================================================ AGENDAMENTOS
+async function renderAgendamentos() {
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Agendamentos</h1><p>Envios programados para uma data/hora futura</p></div>
+      <button class="btn" onclick="navigate('envio')">${icon('send')} Novo envio</button></div>
+    <div id="tabela"></div>`;
+
+  const load = async () => {
+    const list = await API.get('/agendamentos');
+    const stBadge = { pendente: 'aberta', processando: 'pendente', enviado: 'enviado', falha: 'falha', cancelado: 'nao_enviado' };
+    const stLabel = { pendente: 'Agendado', processando: 'Enviando…', enviado: 'Enviado', falha: 'Falha', cancelado: 'Cancelado' };
+    document.getElementById('tabela').innerHTML = list.length ? `
+      <div class="table-wrap"><table><thead><tr>
+        <th>Quando</th><th>Tipo</th><th>Destino</th><th>Status</th><th>Resultado</th><th></th>
+      </tr></thead><tbody>${list.map((a) => {
+        let resultado = '—';
+        if (a.resumo) resultado = a.resumo.erro ? UI.esc(a.resumo.erro) : `${a.resumo.enviados} enviada(s)${a.resumo.falhas ? `, ${a.resumo.falhas} falha(s)` : ''}`;
+        return `<tr>
+          <td class="mono">${UI.fmtDate(a.quando)}</td>
+          <td>${a.tipo === 'massa' ? 'Em massa' : 'Individual'}</td>
+          <td>${UI.esc(a.destino)}</td>
+          <td><span class="badge ${stBadge[a.status] || 'nao_enviado'}">${stLabel[a.status] || a.status}</span></td>
+          <td class="muted" style="font-size:12.5px">${resultado}</td>
+          <td class="actions">${a.status === 'pendente' ? `<button class="icon-btn danger" data-cancel="${a.id}" title="Cancelar">${icon('trash')}</button>` : ''}</td>
+        </tr>`;
+      }).join('')}</tbody></table></div>`
+      : UI.emptyState('calendar', 'Nenhum envio agendado. Marque "Agendar para depois" na tela de envio.');
+
+    document.querySelectorAll('[data-cancel]').forEach((b) => b.onclick = async () => {
+      const ok = await UI.confirm({ title: 'Cancelar agendamento', message: 'Cancelar este envio agendado?', confirmLabel: 'Cancelar envio' });
+      if (!ok) return;
+      try { await API.del(`/agendamentos/${b.dataset.cancel}`); UI.toast('success', 'Agendamento cancelado'); load(); }
+      catch (e) { UI.toast('error', 'Erro', e.message); }
+    });
+  };
+  await load();
+  clearInterval(window._agPoll);
+  window._agPoll = setInterval(() => { if (location.hash.includes('agendamentos')) load(); }, 20000);
 }
 
 // ================================================================ CONEXÃO WHATSAPP

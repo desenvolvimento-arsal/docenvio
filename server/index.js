@@ -497,64 +497,118 @@ async function enviarTextoCliente(cliente, template) {
   return [{ ...atualizado, aluno_nome: cliente.nome, documento_nome: '(mensagem)' }];
 }
 
-// Envio INDIVIDUAL: um cliente + guias escolhidas (ou só mensagem, se sem guias).
-app.post('/api/enviar', async (req, res) => {
-  const cliente = store.find('clientes', req.body.cliente_id);
-  if (!cliente || cliente.owner_id !== req.user.id) return err(res, 400, 'Cliente inválido.');
-  if (!cliente.telefone) return err(res, 422, 'Cliente sem telefone WhatsApp cadastrado.');
-
-  const ids = Array.isArray(req.body.documento_ids) ? req.body.documento_ids : [];
-  const docs = ids.map((id) => store.find('documentos', id)).filter((d) => d && d.owner_id === req.user.id).map(documentoView);
-
+// Lógica de envio INDIVIDUAL reutilizável (rota + agendador). Retorna {erro} ou resumo.
+async function fazerEnvioIndividual(ownerId, body) {
+  const cliente = store.find('clientes', body.cliente_id);
+  if (!cliente || cliente.owner_id !== ownerId) return { erro: 'Cliente inválido.' };
+  if (!cliente.telefone) return { erro: 'Cliente sem telefone WhatsApp cadastrado.' };
+  const ids = Array.isArray(body.documento_ids) ? body.documento_ids : [];
+  const docs = ids.map((id) => store.find('documentos', id)).filter((d) => d && d.owner_id === ownerId).map(documentoView);
   let resultados;
-  if (docs.length) {
-    resultados = await enviarBoletosDeAluno(cliente, docs, req.body.mensagem);
-  } else if ((req.body.mensagem || '').trim()) {
-    resultados = await enviarTextoCliente(cliente, req.body.mensagem); // envio só de texto
-  } else {
-    return err(res, 400, 'Anexe uma guia ou escreva uma mensagem.');
-  }
+  if (docs.length) resultados = await enviarBoletosDeAluno(cliente, docs, body.mensagem);
+  else if ((body.mensagem || '').trim()) resultados = await enviarTextoCliente(cliente, body.mensagem);
+  else return { erro: 'Anexe uma guia ou escreva uma mensagem.' };
   const ok = resultados.filter((r) => r.status === 'enviado').length;
-  res.json({ provider: PROVIDER, total: resultados.length, enviados: ok, falhas: resultados.length - ok, resultados });
-});
+  return { total: resultados.length, enviados: ok, falhas: resultados.length - ok, resultados };
+}
 
-// Envio EM MASSA: vários clientes. modo = 'ultimo' | 'todos'. competencia (opcional) filtra as guias.
-app.post('/api/enviar-massa', async (req, res) => {
-  const clienteIds = Array.isArray(req.body.aluno_ids) ? req.body.aluno_ids : [];
-  const modo = req.body.modo === 'todos' ? 'todos' : 'ultimo';
-  const competencia = (req.body.competencia || '').trim() || null;
-  if (!clienteIds.length) return err(res, 400, 'Selecione ao menos um cliente.');
+// Lógica de envio EM MASSA reutilizável (rota + agendador).
+async function fazerEnvioMassa(ownerId, body) {
+  const clienteIds = Array.isArray(body.aluno_ids) ? body.aluno_ids : [];
+  const modo = body.modo === 'todos' ? 'todos' : 'ultimo';
+  const competencia = (body.competencia || '').trim() || null;
+  if (!clienteIds.length) return { erro: 'Selecione ao menos um cliente.' };
 
   const resultados = [];
-  const ignorados = []; // clientes sem guia ou sem telefone
-
+  const ignorados = [];
   for (const id of clienteIds) {
     const cliente = store.find('clientes', id);
-    if (!cliente || cliente.owner_id !== req.user.id) continue;
+    if (!cliente || cliente.owner_id !== ownerId) continue;
     if (!cliente.telefone) { ignorados.push({ aluno_nome: cliente.nome, motivo: 'sem telefone' }); continue; }
-
     let docs = store.where('documentos', (d) => d.cliente_id === cliente.id).sort((a, b) => b.id - a.id);
     if (competencia) docs = docs.filter((d) => d.competencia === competencia);
     if (!docs.length) { ignorados.push({ aluno_nome: cliente.nome, motivo: competencia ? 'sem guia na competência' : 'sem guia' }); continue; }
-    // Com competência, envia todas as guias daquela competência; senão respeita o modo.
     if (!competencia && modo === 'ultimo') docs = [docs[0]];
     docs = docs.map(documentoView);
-
-    const r = await enviarBoletosDeAluno(cliente, docs, req.body.mensagem);
-    resultados.push(...r);
+    resultados.push(...await enviarBoletosDeAluno(cliente, docs, body.mensagem));
   }
-
   const ok = resultados.filter((r) => r.status === 'enviado').length;
-  res.json({
-    provider: PROVIDER,
-    alunos: clienteIds.length,
-    total: resultados.length,
-    enviados: ok,
-    falhas: resultados.length - ok,
-    ignorados,
-    resultados,
-  });
+  return { alunos: clienteIds.length, total: resultados.length, enviados: ok, falhas: resultados.length - ok, ignorados, resultados };
+}
+
+app.post('/api/enviar', async (req, res) => {
+  const r = await fazerEnvioIndividual(req.user.id, req.body);
+  if (r.erro) return err(res, 400, r.erro);
+  res.json({ provider: PROVIDER, ...r });
 });
+
+app.post('/api/enviar-massa', async (req, res) => {
+  const r = await fazerEnvioMassa(req.user.id, req.body);
+  if (r.erro) return err(res, 400, r.erro);
+  res.json({ provider: PROVIDER, ...r });
+});
+
+// ============================================================== AGENDAMENTOS
+function agendamentoView(a) {
+  const p = a.payload || {};
+  let destino = '';
+  if (a.tipo === 'individual') { const c = store.find('clientes', p.cliente_id); destino = c?.nome || '—'; }
+  else { destino = `${(p.aluno_ids || []).length} cliente(s)${p.competencia ? ` · ${p.competencia}` : ''}`; }
+  return { id: a.id, tipo: a.tipo, quando: a.quando, status: a.status, destino, resumo: a.resumo || null, criado_em: a.criado_em, resultado_em: a.resultado_em || null };
+}
+
+app.get('/api/agendamentos', (req, res) => {
+  const list = store.where('agendamentos', (a) => a.owner_id === req.user.id).sort((a, b) => new Date(a.quando) - new Date(b.quando));
+  res.json(list.map(agendamentoView));
+});
+
+app.post('/api/agendamentos', (req, res) => {
+  const tipo = req.body.tipo === 'massa' ? 'massa' : 'individual';
+  const quando = new Date(req.body.quando);
+  if (isNaN(quando.getTime())) return err(res, 400, 'Data/hora inválida.');
+  if (quando.getTime() < Date.now() - 60000) return err(res, 400, 'Escolha uma data/hora no futuro.');
+  const payload = req.body.payload || {};
+  // valida o que dá para validar agora (dono do cliente etc.)
+  if (tipo === 'individual') {
+    const c = store.find('clientes', payload.cliente_id);
+    if (!c || c.owner_id !== req.user.id) return err(res, 400, 'Cliente inválido.');
+  } else if (!Array.isArray(payload.aluno_ids) || !payload.aluno_ids.length) {
+    return err(res, 400, 'Selecione ao menos um cliente.');
+  }
+  const ag = store.insert('agendamentos', { owner_id: req.user.id, tipo, payload, quando: quando.toISOString(), status: 'pendente' });
+  res.status(201).json(agendamentoView(ag));
+});
+
+app.delete('/api/agendamentos/:id', (req, res) => {
+  const a = store.find('agendamentos', req.params.id);
+  if (!a || a.owner_id !== req.user.id) return err(res, 404, 'Agendamento não encontrado.');
+  if (a.status !== 'pendente') return err(res, 400, 'Só é possível cancelar agendamentos pendentes.');
+  store.remove('agendamentos', a.id);
+  res.status(204).end();
+});
+
+// Loop do agendador: executa os agendamentos vencidos.
+async function processarAgendamentos() {
+  const agora = Date.now();
+  const devidos = store.where('agendamentos', (a) => a.status === 'pendente' && new Date(a.quando).getTime() <= agora);
+  for (const a of devidos) {
+    store.update('agendamentos', a.id, { status: 'processando' }); // trava contra dupla execução
+    try {
+      const r = a.tipo === 'individual'
+        ? await fazerEnvioIndividual(a.owner_id, a.payload)
+        : await fazerEnvioMassa(a.owner_id, a.payload);
+      const falhou = r.erro || (r.enviados === 0 && (r.total || 0) > 0);
+      store.update('agendamentos', a.id, {
+        status: r.erro ? 'falha' : (falhou ? 'falha' : 'enviado'),
+        resumo: r.erro ? { erro: r.erro } : { enviados: r.enviados, falhas: r.falhas },
+        resultado_em: new Date().toISOString(),
+      });
+    } catch (e) {
+      store.update('agendamentos', a.id, { status: 'falha', resumo: { erro: e.message }, resultado_em: new Date().toISOString() });
+    }
+  }
+}
+setInterval(() => { processarAgendamentos().catch(() => {}); }, 30000);
 
 // ============================================================== DASHBOARD
 app.get('/api/dashboard', (req, res) => {
