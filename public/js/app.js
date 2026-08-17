@@ -770,14 +770,10 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
           <textarea id="m-msg" rows="6">${msgPadrao}</textarea>
           <div class="mono-count">use {{nome}}, {{competencia}} e {{lista}}</div>
         </div>
-        <div style="margin:4px 0 12px">
-          <label style="font-size:13px;font-weight:600;color:var(--text-2);display:flex;align-items:center;gap:6px">${icon('clock')} Ritmo de envio <span class="opt">(anti-bloqueio)</span></label>
-          <select id="m-ritmo" class="filter" style="width:100%;margin-top:6px">
-            <option value="seguro">🟢 Seguro — 30 a 60s entre cada (recomendado)</option>
-            <option value="moderado">🟡 Moderado — 12 a 25s entre cada</option>
-            <option value="rapido">🔴 Rápido — 6 a 12s (mais arriscado)</option>
-          </select>
-          <div class="hint" style="margin-top:4px">As mensagens saem uma a uma, com intervalo aleatório, para imitar um envio humano.</div>
+        <div class="alert" style="background:var(--success-soft);color:#17824e;margin:4px 0 12px;align-items:flex-start">
+          ${icon('clock')}
+          <div><b>Ritmo seguro (30 a 60s entre cada envio)</b><br>
+          <span style="font-size:12.5px">As mensagens saem <b>uma a uma</b>, com intervalo aleatório, para imitar um envio humano e <b>reduzir o risco de bloqueio</b> do seu WhatsApp. Este ritmo é fixo por segurança.</span></div>
         </div>
         ${schedBlock('m')}
         <button class="btn success block" id="m-enviar" disabled>${icon('send')} Enviar em massa</button>
@@ -792,6 +788,7 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
 
   const $ = (id) => root.querySelector('#' + id);
   const selected = new Set();
+  const selDocs = new Map(); // clienteId -> Set(documento_id escolhidos). Ausente = todas (default).
   let filtro = '';
   let docs = [];
   try { docs = await API.get('/documentos'); } catch { docs = []; }
@@ -806,21 +803,49 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
   const guiasDe = (clienteId) => docs.filter((d) => d.cliente_id === clienteId && (!compSel() || d.competencia === compSel()));
   const visiveis = () => alunos.filter((a) => a.nome.toLowerCase().includes(filtro));
 
+  // Guias efetivamente escolhidas de um cliente (respeita desmarcações; ausente = todas).
+  const guiasSelecionadas = (clienteId) => {
+    const guias = guiasDe(clienteId);
+    const set = selDocs.get(clienteId);
+    return set ? guias.filter((g) => set.has(g.id)) : guias;
+  };
+
   const renderList = () => {
     const list = visiveis();
     $('m-list').innerHTML = list.length ? list.map((a) => {
-      const n = guiasDe(a.id).length;
+      const guias = guiasDe(a.id);
+      const n = guias.length;
       const sem = n === 0;
-      if (sem) selected.delete(a.id);
-      return `<label class="${sem ? 'no-doc' : ''}">
-        <input type="checkbox" value="${a.id}" ${selected.has(a.id) ? 'checked' : ''} ${sem ? 'disabled' : ''} />
-        <span class="an">${UI.esc(a.nome)}</span>
-        <span class="am">${sem ? 'sem guia' : `${n} guia(s)`}</span></label>`;
+      if (sem) { selected.delete(a.id); selDocs.delete(a.id); }
+      const isSel = selected.has(a.id);
+      const set = selDocs.get(a.id);
+      const nSel = guias.filter((g) => !set || set.has(g.id)).length;
+      const guiasHtml = isSel && n ? `<div class="mass-guias">${guias.map((g) => {
+        const on = !set || set.has(g.id);
+        return `<label class="mass-guia"><input type="checkbox" data-guia="${a.id}:${g.id}" ${on ? 'checked' : ''}/>
+          <span class="mg-tipo">${UI.esc(g.tipo_documento || 'Guia')}${typeof g.valor === 'number' ? ` · ${FMT.valor(g.valor)}` : ''}</span>
+          <span class="mg-file">${UI.esc(g.nome_arquivo)}</span></label>`;
+      }).join('')}</div>` : '';
+      return `<div class="mass-cli ${sem ? 'no-doc' : ''}">
+        <label class="mass-cli-head">
+          <input type="checkbox" data-cli="${a.id}" ${isSel ? 'checked' : ''} ${sem ? 'disabled' : ''}/>
+          <span class="an">${UI.esc(a.nome)}</span>
+          <span class="am">${sem ? 'sem guia' : (isSel ? `${nSel} de ${n} guia(s)` : `${n} guia(s)`)}</span>
+        </label>${guiasHtml}</div>`;
     }).join('') : '<div class="empty" style="padding:24px">Nenhum cliente encontrado.</div>';
-    $('m-list').querySelectorAll('input[type=checkbox]').forEach((cb) => cb.onchange = () => {
-      const id = Number(cb.value);
-      cb.checked ? selected.add(id) : selected.delete(id);
-      updateUI();
+
+    $('m-list').querySelectorAll('[data-cli]').forEach((cb) => cb.onchange = () => {
+      const id = Number(cb.dataset.cli);
+      if (cb.checked) { selected.add(id); selDocs.set(id, new Set(guiasDe(id).map((g) => g.id))); }
+      else { selected.delete(id); selDocs.delete(id); }
+      renderList(); updateUI();
+    });
+    $('m-list').querySelectorAll('[data-guia]').forEach((cb) => cb.onchange = () => {
+      const [cid, gid] = cb.dataset.guia.split(':').map(Number);
+      let set = selDocs.get(cid);
+      if (!set) { set = new Set(guiasDe(cid).map((g) => g.id)); selDocs.set(cid, set); }
+      cb.checked ? set.add(gid) : set.delete(gid);
+      renderList(); updateUI();
     });
   };
 
@@ -835,8 +860,8 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
     const first = alunos.find((a) => selected.has(a.id));
     if (!first) { $('m-body').innerHTML = '<div class="wa-empty">A prévia da mensagem aparecerá aqui.</div>'; $('m-dest').textContent = 'nenhum cliente selecionado'; return; }
     $('m-dest').textContent = `${selected.size} cliente(s) selecionado(s)`;
-    const gs = guiasDe(first.id);
-    const lista = gs.map(linhaPreview).join('\n') || '• (guias do cliente)';
+    const gs = guiasSelecionadas(first.id);
+    const lista = gs.map(linhaPreview).join('\n') || '• (nenhuma guia marcada)';
     const comp = FMT.competencia(compSel() || gs.find((d) => d.competencia)?.competencia);
     const texto = $('m-msg').value.replaceAll('{{nome}}', first.nome).replaceAll('{{competencia}}', comp === '—' ? 'informada' : comp).replaceAll('{{lista}}', lista);
     const anexos = gs.map((d) => `<div class="wa-attach">${icon('paperclip')}<div class="an">${UI.esc(d.nome_arquivo)}</div></div>`).join('');
@@ -854,10 +879,13 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
     updatePreview();
   };
 
-  $('m-comp').onchange = () => { renderList(); updateUI(); };
+  $('m-comp').onchange = () => { selDocs.clear(); renderList(); updateUI(); }; // guias diferem por competência
   $('m-busca').oninput = (e) => { filtro = e.target.value.toLowerCase(); renderList(); updateUI(); };
   $('m-all').onchange = (e) => {
-    visiveis().filter((a) => guiasDe(a.id).length > 0).forEach((a) => e.target.checked ? selected.add(a.id) : selected.delete(a.id));
+    visiveis().filter((a) => guiasDe(a.id).length > 0).forEach((a) => {
+      if (e.target.checked) { selected.add(a.id); selDocs.set(a.id, new Set(guiasDe(a.id).map((g) => g.id))); }
+      else { selected.delete(a.id); selDocs.delete(a.id); }
+    });
     renderList(); updateUI();
   };
   $('m-msg').oninput = updatePreview;
@@ -866,7 +894,11 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
 
   $('m-enviar').onclick = async () => {
     const btn = $('m-enviar');
-    const payload = { aluno_ids: [...selected], competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value, ritmo: $('m-ritmo').value };
+    const selecao = [...selected]
+      .map((cid) => ({ cliente_id: cid, documento_ids: guiasSelecionadas(cid).map((g) => g.id) }))
+      .filter((s) => s.documento_ids.length);
+    if (!selecao.length) return UI.toast('warning', 'Nenhuma guia marcada para envio');
+    const payload = { aluno_ids: [...selected], selecao, competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value, ritmo: 'seguro' };
     if (sched.agendado()) {
       if (!sched.valido()) return UI.toast('warning', 'Escolha uma data/hora futura');
       btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Agendando…`;

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { dirname, join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { store, seedIfEmpty } from './store.js';
+import { store, seedIfEmpty, init as initStore, shutdown as shutdownStore } from './store.js';
 import { normalizePhoneBR, isNonEmpty, onlyDigits, isValidCNPJ, formatCNPJ } from './validators.js';
 import { enviarWhatsApp, whatsappStatus, buildWaLink, evolutionConnect, evolutionLogout, PROVIDER } from './whatsapp.js';
 import { hashSenha, verificarSenha, novoToken, userView, requireAuth, requireAdmin } from './auth.js';
@@ -275,6 +275,12 @@ function parseValor(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Corrige acentos no nome do arquivo: o multer entrega originalname em latin1;
+// reinterpretar como UTF-8 recupera "Cópia" em vez de "CÃ³pia".
+function nomeUtf8(name) {
+  try { return Buffer.from(String(name), 'latin1').toString('utf8'); } catch { return name; }
+}
+
 // Campos fiscais da guia a partir do corpo da requisição.
 function guiaFields(body) {
   return {
@@ -299,7 +305,7 @@ app.post('/api/documentos', upload.single('arquivo'), (req, res) => {
     cliente_id: cliente.id,
     owner_id: req.user.id,
     ...guiaFields(req.body),
-    nome_arquivo: req.file.originalname,
+    nome_arquivo: nomeUtf8(req.file.originalname),
     caminho_arquivo: req.file.path,
     mime_type: req.file.mimetype,
     tamanho_bytes: req.file.size,
@@ -323,20 +329,21 @@ app.post('/api/documentos/lote', upload.array('arquivos', 200), (req, res) => {
   const nao_casados = [];
 
   for (const file of req.files) {
-    const match = casarCliente(file.originalname, clientes);
+    const nome = nomeUtf8(file.originalname);
+    const match = casarCliente(nome, clientes);
     if (match.cliente) {
       const doc = store.insert('documentos', {
         cliente_id: match.cliente.id,
         owner_id: req.user.id,
         ...base,
-        nome_arquivo: file.originalname,
+        nome_arquivo: nome,
         caminho_arquivo: file.path,
         mime_type: file.mimetype,
         tamanho_bytes: file.size,
       });
-      inseridos.push({ documento_id: doc.id, arquivo: file.originalname, cliente_nome: match.cliente.nome, por: match.por });
+      inseridos.push({ documento_id: doc.id, arquivo: nome, cliente_nome: match.cliente.nome, por: match.por });
     } else {
-      nao_casados.push({ arquivo: file.originalname, caminho: file.path, motivo: match.motivo });
+      nao_casados.push({ arquivo: nome, caminho: file.path, motivo: match.motivo });
     }
   }
   res.status(201).json({ total: req.files.length, casados: inseridos.length, inseridos, nao_casados });
@@ -529,24 +536,48 @@ function docsParaEnvio(cliente, competencia, modo) {
 }
 
 // Cria um LOTE de envio em massa, processado em segundo plano com delay entre clientes.
+// Aceita seleção explícita por cliente (body.selecao = [{cliente_id, documento_ids}]).
 function iniciarLoteMassa(ownerId, body) {
-  const clienteIds = Array.isArray(body.aluno_ids) ? body.aluno_ids : [];
   const modo = body.modo === 'todos' ? 'todos' : 'ultimo';
   const competencia = (body.competencia || '').trim() || null;
-  if (!clienteIds.length) return { erro: 'Selecione ao menos um cliente.' };
   const ritmo = RITMOS[body.ritmo] || RITMOS.seguro;
+
+  // Monta a seleção por cliente (mapa clienteId -> [documento_ids]) quando fornecida.
+  const selMap = {};
+  if (Array.isArray(body.selecao) && body.selecao.length) {
+    for (const s of body.selecao) {
+      if (s && s.cliente_id != null && Array.isArray(s.documento_ids)) selMap[s.cliente_id] = s.documento_ids;
+    }
+  }
+  const clienteIds = Object.keys(selMap).length
+    ? Object.keys(selMap).map(Number)
+    : (Array.isArray(body.aluno_ids) ? body.aluno_ids : []);
+  if (!clienteIds.length) return { erro: 'Selecione ao menos um cliente.' };
 
   const fila = [];
   const ignorados = [];
+  const selecao = {}; // validada, salva no lote
   for (const id of clienteIds) {
     const c = store.find('clientes', id);
     if (!c || c.owner_id !== ownerId) continue;
     if (!c.telefone) { ignorados.push({ aluno_nome: c.nome, motivo: 'sem telefone' }); continue; }
-    if (!docsParaEnvio(c, competencia, modo)) { ignorados.push({ aluno_nome: c.nome, motivo: competencia ? 'sem guia na competência' : 'sem guia' }); continue; }
+
+    if (selMap[id]) {
+      // valida os documentos escolhidos: precisam ser do dono E daquele cliente
+      const validos = selMap[id]
+        .map((docId) => store.find('documentos', docId))
+        .filter((d) => d && d.owner_id === ownerId && d.cliente_id === c.id)
+        .map((d) => d.id);
+      if (!validos.length) { ignorados.push({ aluno_nome: c.nome, motivo: 'nenhuma guia selecionada' }); continue; }
+      selecao[id] = validos;
+    } else {
+      if (!docsParaEnvio(c, competencia, modo)) { ignorados.push({ aluno_nome: c.nome, motivo: competencia ? 'sem guia na competência' : 'sem guia' }); continue; }
+    }
     fila.push(c.id);
   }
   const lote = store.insert('lotes', {
     owner_id: ownerId, mensagem: body.mensagem || null, competencia, modo,
+    selecao: Object.keys(selecao).length ? selecao : null,
     fila, total: fila.length, enviados: 0, falhas: 0, ignorados, resultados: [],
     min_delay: ritmo.min, max_delay: ritmo.max, ritmo: body.ritmo || 'seguro',
     status: fila.length ? 'processando' : 'concluido', proximo: Date.now(),
@@ -569,8 +600,10 @@ async function processarLotes() {
         const cliente = store.find('clientes', clienteId);
         if (cliente) {
           nome = cliente.nome;
-          const docs = docsParaEnvio(cliente, l.competencia, l.modo);
-          if (docs) {
+          const docs = (l.selecao && l.selecao[clienteId])
+            ? l.selecao[clienteId].map((id) => store.find('documentos', id)).filter((d) => d && d.owner_id === l.owner_id).map(documentoView)
+            : docsParaEnvio(cliente, l.competencia, l.modo);
+          if (docs && docs.length) {
             const rs = await enviarBoletosDeAluno(cliente, docs, l.mensagem);
             enviados = rs.filter((x) => x.status === 'enviado').length;
             falhas = rs.length - enviados;
@@ -705,11 +738,18 @@ app.use((error, _req, res, _next) => {
   return err(res, 400, error.message || 'Erro inesperado.');
 });
 
+await initStore(); // carrega/cria a base (PostgreSQL em prod, arquivo em dev)
 seedIfEmpty();
 seedAdmin();
 app.listen(PORT, () => {
   console.log(`\n  Sistema de Envio de Documentos por WhatsApp`);
   console.log(`  → http://localhost:${PORT}`);
+  console.log(`  → Persistência: ${process.env.DATABASE_URL ? 'PostgreSQL' : 'arquivo (data/db.json)'}`);
   console.log(`  → Provedor de WhatsApp: ${PROVIDER.toUpperCase()}${PROVIDER === 'mock' ? ' (simulação)' : ''}`);
   console.log(`  → Login em /login.html\n`);
 });
+
+// Grava pendências e encerra com elegância (redeploy envia SIGTERM).
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => { await shutdownStore(); process.exit(0); });
+}
