@@ -366,6 +366,7 @@ select.filter.sm { padding: 5px 8px; font-size: 12.5px; }
 
 .quick-actions { display: flex; flex-direction: column; gap: 9px; }
 
+.qr-loading { display: grid; place-items: center; min-height: 250px; margin: 16px auto; color: var(--text-2); gap: 8px; }
 .spin { animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import { store, seedIfEmpty } from './store.js';
 import { normalizePhoneBR, isNonEmpty, onlyDigits, isValidCNPJ, formatCNPJ } from './validators.js';
-import { enviarWhatsApp, whatsappStatus, buildWaLink, evolutionConnect, PROVIDER } from './whatsapp.js';
+import { enviarWhatsApp, whatsappStatus, buildWaLink, evolutionConnect, evolutionLogout, PROVIDER } from './whatsapp.js';
 import { hashSenha, verificarSenha, novoToken, userView, requireAuth, requireAdmin } from './auth.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -137,19 +137,30 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
 });
 
 // ================================================================ WHATSAPP
-app.get('/api/whatsapp/status', async (_req, res) => {
-  res.json(await whatsappStatus());
+// Cada conta tem a PRÓPRIA instância na Evolution: docenvio_u<id>.
+const instanceOf = (user) => `docenvio_u${user.id}`;
+
+app.get('/api/whatsapp/status', async (req, res) => {
+  res.json(await whatsappStatus(instanceOf(req.user)));
 });
 
-// QR Code para conectar a instância (apenas no provedor Evolution).
-app.get('/api/whatsapp/qr', async (_req, res) => {
+// QR Code para o usuário conectar o WhatsApp dele (cria a instância se preciso).
+app.get('/api/whatsapp/qr', async (req, res) => {
   if (PROVIDER !== 'evolution') return err(res, 400, 'Conexão por QR disponível apenas com a Evolution API.');
   try {
-    const status = await whatsappStatus();
+    const instance = instanceOf(req.user);
+    const status = await whatsappStatus(instance);
     if (status.conectado) return res.json({ conectado: true });
-    const qr = await evolutionConnect();
+    const qr = await evolutionConnect(instance);
     res.json({ conectado: false, ...qr });
   } catch (e) { err(res, 502, e.message); }
+});
+
+// Desconecta o WhatsApp do usuário (logout da instância dele).
+app.post('/api/whatsapp/desconectar', async (req, res) => {
+  if (PROVIDER !== 'evolution') return err(res, 400, 'Disponível apenas com a Evolution API.');
+  try { await evolutionLogout(instanceOf(req.user)); res.json({ ok: true }); }
+  catch (e) { err(res, 502, e.message); }
 });
 
 // ================================================================ CLIENTES
@@ -440,9 +451,10 @@ app.get('/api/envios', (req, res) => {
   res.json(view);
 });
 
-// Envia os boletos (docs) de um aluno por WhatsApp. Retorna lista de resultados.
+// Envia os boletos (docs) de um cliente por WhatsApp, pela instância do DONO. Retorna resultados.
 async function enviarBoletosDeAluno(aluno, docs, template) {
   const texto = montarMensagem(template, aluno, docs);
+  const instance = `docenvio_u${aluno.owner_id}`;
   const resultados = [];
   for (const doc of docs) {
     const registro = store.insert('envios', {
@@ -455,6 +467,7 @@ async function enviarBoletosDeAluno(aluno, docs, template) {
       provider: PROVIDER,
     });
     const r = await enviarWhatsApp({
+      instance,
       telefone: aluno.telefone,
       texto,
       documento: { caminho: doc.caminho_arquivo, nome_arquivo: doc.nome_arquivo, mime_type: doc.mime_type },
@@ -477,7 +490,7 @@ async function enviarTextoCliente(cliente, template) {
     documento_id: null, cliente_id: cliente.id, owner_id: cliente.owner_id, status: 'pendente',
     mensagem: texto, wa_link: buildWaLink(cliente.telefone, texto), provider: PROVIDER,
   });
-  const r = await enviarWhatsApp({ telefone: cliente.telefone, texto });
+  const r = await enviarWhatsApp({ instance: `docenvio_u${cliente.owner_id}`, telefone: cliente.telefone, texto });
   const atualizado = store.update('envios', registro.id, {
     status: r.status, erro: r.erro || null, provider_message_id: r.providerMessageId || null, provider: r.provider,
   });

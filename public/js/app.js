@@ -8,6 +8,7 @@ const ROUTES = {
   envio: { title: 'Envio de Guias', render: renderEnvio },
   clientes: { title: 'Clientes', render: renderClientes },
   documentos: { title: 'Guias & Boletos', render: renderDocumentos },
+  whatsapp: { title: 'Conexão WhatsApp', render: renderWhatsapp },
   'tipos-documento': { title: 'Tipos de Guia', render: () => renderTipos('tipos-documento', 'Tipo de Guia') },
   'tipos-pagamento': { title: 'Formas de Pagamento', render: () => renderTipos('tipos-pagamento', 'Forma de Pagamento') },
   admin: { title: 'Contas', render: renderAdmin },
@@ -26,6 +27,7 @@ function navigate(route) {
 }
 
 async function router() {
+  if (window._waPoll) { clearInterval(window._waPoll); window._waPoll = null; } // para polling do QR ao sair
   const hash = location.hash.replace('#', '') || 'rapido';
   view.innerHTML = '<div class="empty">Carregando…</div>';
 
@@ -989,6 +991,73 @@ async function renderEnvioRapido() {
   };
 
   update();
+}
+
+// ================================================================ CONEXÃO WHATSAPP
+async function renderWhatsapp() {
+  view.innerHTML = `
+    <div class="page-head"><div><h1>Conexão WhatsApp</h1><p>Conecte o WhatsApp do seu escritório para enviar as guias</p></div></div>
+    <div id="wa-pane"><div class="empty">Carregando…</div></div>`;
+  const pane = document.getElementById('wa-pane');
+
+  const renderConectado = (s) => {
+    pane.innerHTML = `
+      <div class="card card-pad" style="max-width:540px">
+        <div style="display:flex;align-items:center;gap:14px">
+          <div class="kpi-ico green" style="width:52px;height:52px">${icon('whatsapp')}</div>
+          <div><h3 style="font-size:17px">WhatsApp conectado</h3>
+            <div class="muted" style="font-size:13px">${UI.esc(s.detalhe || '')}</div></div>
+        </div>
+        <div class="alert warn" style="margin-top:16px">${icon('alert')}<div>Ao desconectar, será preciso ler o QR Code de novo para voltar a enviar.</div></div>
+        <button class="btn danger" id="wa-off" style="margin-top:16px">${icon('power')} Desconectar WhatsApp</button>
+      </div>`;
+    document.getElementById('wa-off').onclick = async () => {
+      const ok = await UI.confirm({ title: 'Desconectar WhatsApp', message: 'Você precisará reconectar (novo QR) para enviar guias. Continuar?', confirmLabel: 'Desconectar' });
+      if (!ok) return;
+      try { await API.post('/whatsapp/desconectar'); UI.toast('success', 'WhatsApp desconectado'); refreshWaStatus(); renderWhatsapp(); }
+      catch (e) { UI.toast('error', 'Erro', e.message); }
+    };
+  };
+
+  const renderConectar = () => {
+    pane.innerHTML = `
+      <div class="card card-pad" style="max-width:540px;text-align:center">
+        <div class="kpi-ico" style="width:52px;height:52px;margin:0 auto 10px;background:var(--warning-soft);color:var(--warning)">${icon('whatsapp')}</div>
+        <h3 style="font-size:17px">Nenhum WhatsApp conectado</h3>
+        <p class="muted" style="font-size:13.5px;margin:6px 0 16px">Conecte o número do seu escritório para enviar as guias por aqui.</p>
+        <button class="btn success" id="wa-start">${icon('link')} Conectar meu WhatsApp</button>
+      </div>`;
+    document.getElementById('wa-start').onclick = iniciarQR;
+  };
+
+  const iniciarQR = () => {
+    pane.innerHTML = `
+      <div class="card card-pad" style="max-width:540px;text-align:center">
+        <h3 style="font-size:16px">Leia o QR Code</h3>
+        <ol class="steps" style="max-width:340px;margin:10px auto;text-align:left;font-size:13px;color:var(--text-2)">
+          <li>Abra o <b>WhatsApp</b> no celular</li>
+          <li>Toque em <b>⋮ → Dispositivos conectados</b></li>
+          <li>Toque em <b>Conectar um dispositivo</b> e aponte para o código</li>
+        </ol>
+        <div id="wa-qr" class="qr-loading">${icon('spinner', 'spin')} Gerando QR…</div>
+        <div class="hint">O código atualiza sozinho. Assim que conectar, esta tela avança.</div>
+      </div>`;
+    const tick = async () => {
+      try {
+        const r = await API.get('/whatsapp/qr');
+        if (r.conectado) { clearInterval(window._waPoll); window._waPoll = null; UI.toast('success', 'WhatsApp conectado!'); refreshWaStatus(); renderWhatsapp(); return; }
+        if (r.base64) document.getElementById('wa-qr').innerHTML = `<img src="${r.base64}" alt="QR Code" style="width:250px;height:250px;image-rendering:pixelated" />`;
+      } catch (e) { const el = document.getElementById('wa-qr'); if (el) el.innerHTML = `<div class="muted">${UI.esc(e.message)}</div>`; }
+    };
+    tick();
+    window._waPoll = setInterval(tick, 6000);
+  };
+
+  try {
+    const s = await API.get('/whatsapp/status');
+    if (s.provider === 'mock') { pane.innerHTML = UI.emptyState('whatsapp', 'Modo simulação — Evolution API não configurada no servidor.'); return; }
+    if (s.conectado) renderConectado(s); else renderConectar();
+  } catch (e) { pane.innerHTML = UI.emptyState('alert', e.message); }
 }
 
 // ================================================================ ADMIN (contas)
