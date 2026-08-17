@@ -110,10 +110,13 @@ export async function evolutionLogout(instance) {
   return true;
 }
 
+// Delay (ms) que a Evolution mostra "digitando" antes de enviar — deixa o envio mais humano.
+const TYPING_DELAY_MS = 1200;
+
 async function evolutionSendText(instance, number, text) {
   const res = await evoFetch(evoUrl(`/message/sendText/${instance}`), {
-    method: 'POST', headers: evoHeaders(), body: JSON.stringify({ number, text }),
-  });
+    method: 'POST', headers: evoHeaders(), body: JSON.stringify({ number, text, delay: TYPING_DELAY_MS }),
+  }, 30000);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
   return data;
@@ -125,9 +128,9 @@ async function evolutionSendMedia(instance, number, { caminho, nome_arquivo, mim
     method: 'POST', headers: evoHeaders(),
     body: JSON.stringify({
       number, mediatype: mediatypeFor(mime_type), mimetype: mime_type || 'application/octet-stream',
-      media: buffer.toString('base64'), fileName: nome_arquivo, caption,
+      media: buffer.toString('base64'), fileName: nome_arquivo, caption, delay: TYPING_DELAY_MS,
     }),
-  });
+  }, 45000);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.message || data?.error || `HTTP ${res.status}`);
   return data;

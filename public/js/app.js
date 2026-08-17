@@ -54,6 +54,7 @@ function navigate(route) {
 async function router() {
   if (window._waPoll) { clearInterval(window._waPoll); window._waPoll = null; } // para polling do QR ao sair
   if (window._agPoll) { clearInterval(window._agPoll); window._agPoll = null; }
+  if (window._lotePoll) { clearInterval(window._lotePoll); window._lotePoll = null; }
   const hash = location.hash.replace('#', '') || 'rapido';
   view.innerHTML = '<div class="empty">Carregando…</div>';
 
@@ -769,6 +770,15 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
           <textarea id="m-msg" rows="6">${msgPadrao}</textarea>
           <div class="mono-count">use {{nome}}, {{competencia}} e {{lista}}</div>
         </div>
+        <div style="margin:4px 0 12px">
+          <label style="font-size:13px;font-weight:600;color:var(--text-2);display:flex;align-items:center;gap:6px">${icon('clock')} Ritmo de envio <span class="opt">(anti-bloqueio)</span></label>
+          <select id="m-ritmo" class="filter" style="width:100%;margin-top:6px">
+            <option value="seguro">🟢 Seguro — 30 a 60s entre cada (recomendado)</option>
+            <option value="moderado">🟡 Moderado — 12 a 25s entre cada</option>
+            <option value="rapido">🔴 Rápido — 6 a 12s (mais arriscado)</option>
+          </select>
+          <div class="hint" style="margin-top:4px">As mensagens saem uma a uma, com intervalo aleatório, para imitar um envio humano.</div>
+        </div>
         ${schedBlock('m')}
         <button class="btn success block" id="m-enviar" disabled>${icon('send')} Enviar em massa</button>
         <div class="mass-results" id="m-results"></div>
@@ -856,7 +866,7 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
 
   $('m-enviar').onclick = async () => {
     const btn = $('m-enviar');
-    const payload = { aluno_ids: [...selected], competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value };
+    const payload = { aluno_ids: [...selected], competencia: compSel(), modo: 'todos', mensagem: $('m-msg').value, ritmo: $('m-ritmo').value };
     if (sched.agendado()) {
       if (!sched.valido()) return UI.toast('warning', 'Escolha uma data/hora futura');
       btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Agendando…`;
@@ -867,28 +877,50 @@ async function renderEnvioMassa(alunos, root, msgPadrao) {
       } catch (e) { UI.toast('error', 'Não foi possível agendar', e.message); }
       btn.disabled = false; updateUI(); return;
     }
-    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Enviando para ${selected.size} cliente(s)…`;
+    btn.disabled = true; btn.innerHTML = `${icon('spinner', 'spin')} Iniciando…`;
     $('m-results').innerHTML = '';
     try {
       const res = await API.post('/enviar-massa', payload);
-      if (res.falhas === 0 && res.enviados > 0) UI.toast('success', 'Envio em massa concluído', `${res.enviados} guia(s) para ${res.alunos} cliente(s).`);
-      else if (res.enviados === 0) UI.toast('error', 'Nenhum envio realizado', 'Verifique a conexão do WhatsApp.');
-      else UI.toast('warning', 'Envio parcial', `${res.enviados} enviada(s), ${res.falhas} falha(s).`);
-
-      const porAluno = {};
-      res.resultados.forEach((r) => {
-        porAluno[r.aluno_nome] = porAluno[r.aluno_nome] || { ok: 0, fail: 0 };
-        r.status === 'enviado' ? porAluno[r.aluno_nome].ok++ : porAluno[r.aluno_nome].fail++;
-      });
-      const linhas = Object.entries(porAluno).map(([nome, s]) =>
-        `<div class="r-item"><span>${UI.esc(nome)}</span>${UI.badge(s.fail === 0 ? 'enviado' : (s.ok === 0 ? 'falha' : 'pendente'))}</div>`).join('');
-      const ign = (res.ignorados || []).map((i) =>
-        `<div class="r-item"><span class="muted">${UI.esc(i.aluno_nome)}</span><span class="badge nao_enviado">Ignorado · ${UI.esc(i.motivo)}</span></div>`).join('');
-      $('m-results').innerHTML = `<h3 style="font-size:14px;margin:6px 0 8px">Resultado do envio</h3>${linhas}${ign}`;
-      refreshWaStatus();
-    } catch (e) { UI.toast('error', 'Não foi possível enviar', e.message); }
-    btn.disabled = false; updateUI();
+      if (!res.total) { UI.toast('warning', 'Nenhum cliente para enviar', `${(res.ignorados || []).length} ignorado(s).`); btn.disabled = false; updateUI(); return; }
+      UI.toast('info', 'Envio iniciado', `${res.total} cliente(s) na fila, com intervalo entre cada.`);
+      acompanharLote(res.lote_id, res.ignorados || []);
+    } catch (e) { UI.toast('error', 'Não foi possível enviar', e.message); btn.disabled = false; updateUI(); }
   };
+
+  // Acompanha um lote em segundo plano com barra de progresso.
+  function acompanharLote(loteId, ignorados) {
+    const render = (l) => {
+      const done = l.enviados + l.falhas;
+      const pct = l.total ? Math.round(done / l.total * 100) : 100;
+      const concl = l.status === 'concluido';
+      $('m-results').innerHTML = `
+        <div class="lote-prog">
+          <div class="lote-head">${concl ? icon('check') : icon('spinner', 'spin')} <b>${concl ? 'Envio concluído' : 'Enviando…'}</b><span class="muted" style="margin-left:auto">${done}/${l.total}</span></div>
+          <div class="progbar"><div class="progbar-fill" style="width:${pct}%"></div></div>
+          <div class="lote-stats">
+            <span class="badge enviado">${l.enviados} enviada(s)</span>
+            ${l.falhas ? `<span class="badge falha">${l.falhas} falha(s)</span>` : ''}
+            ${l.restantes ? `<span class="badge nao_enviado">${l.restantes} na fila</span>` : ''}
+          </div>
+          ${!concl ? '<div class="hint" style="margin-top:6px">Pode sair desta tela — o envio continua no servidor, um a um.</div>' : ''}
+          ${ignorados.length ? `<div class="hint" style="margin-top:6px">${ignorados.length} ignorado(s): ${ignorados.map((i) => UI.esc(i.aluno_nome)).slice(0, 5).join(', ')}${ignorados.length > 5 ? '…' : ''}</div>` : ''}
+        </div>`;
+    };
+    const tick = async () => {
+      try {
+        const l = await API.get('/lotes/' + loteId);
+        render(l);
+        if (l.status === 'concluido') {
+          clearInterval(window._lotePoll); window._lotePoll = null;
+          UI.toast(l.falhas ? 'warning' : 'success', 'Envio em massa concluído', `${l.enviados} enviada(s)${l.falhas ? `, ${l.falhas} falha(s)` : ''}`);
+          $('m-enviar').disabled = false; updateUI();
+        }
+      } catch { /* ignore */ }
+    };
+    tick();
+    clearInterval(window._lotePoll);
+    window._lotePoll = setInterval(tick, 3000);
+  }
 
   renderList(); updateUI();
 }

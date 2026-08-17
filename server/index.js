@@ -512,29 +512,87 @@ async function fazerEnvioIndividual(ownerId, body) {
   return { total: resultados.length, enviados: ok, falhas: resultados.length - ok, resultados };
 }
 
-// Lógica de envio EM MASSA reutilizável (rota + agendador).
-async function fazerEnvioMassa(ownerId, body) {
+// Ritmos de envio em massa (delay ALEATÓRIO entre clientes, em ms) — anti-banimento.
+const RITMOS = {
+  seguro:   { min: 30000, max: 60000 }, // 30–60s  (recomendado)
+  moderado: { min: 12000, max: 25000 }, // 12–25s
+  rapido:   { min: 6000,  max: 12000 }, // 6–12s   (mais arriscado)
+};
+
+// Documentos (documentoView) de um cliente para envio, conforme competência/modo. null se não houver.
+function docsParaEnvio(cliente, competencia, modo) {
+  let docs = store.where('documentos', (d) => d.cliente_id === cliente.id).sort((a, b) => b.id - a.id);
+  if (competencia) docs = docs.filter((d) => d.competencia === competencia);
+  if (!docs.length) return null;
+  if (!competencia && modo === 'ultimo') docs = [docs[0]];
+  return docs.map(documentoView);
+}
+
+// Cria um LOTE de envio em massa, processado em segundo plano com delay entre clientes.
+function iniciarLoteMassa(ownerId, body) {
   const clienteIds = Array.isArray(body.aluno_ids) ? body.aluno_ids : [];
   const modo = body.modo === 'todos' ? 'todos' : 'ultimo';
   const competencia = (body.competencia || '').trim() || null;
   if (!clienteIds.length) return { erro: 'Selecione ao menos um cliente.' };
+  const ritmo = RITMOS[body.ritmo] || RITMOS.seguro;
 
-  const resultados = [];
+  const fila = [];
   const ignorados = [];
   for (const id of clienteIds) {
-    const cliente = store.find('clientes', id);
-    if (!cliente || cliente.owner_id !== ownerId) continue;
-    if (!cliente.telefone) { ignorados.push({ aluno_nome: cliente.nome, motivo: 'sem telefone' }); continue; }
-    let docs = store.where('documentos', (d) => d.cliente_id === cliente.id).sort((a, b) => b.id - a.id);
-    if (competencia) docs = docs.filter((d) => d.competencia === competencia);
-    if (!docs.length) { ignorados.push({ aluno_nome: cliente.nome, motivo: competencia ? 'sem guia na competência' : 'sem guia' }); continue; }
-    if (!competencia && modo === 'ultimo') docs = [docs[0]];
-    docs = docs.map(documentoView);
-    resultados.push(...await enviarBoletosDeAluno(cliente, docs, body.mensagem));
+    const c = store.find('clientes', id);
+    if (!c || c.owner_id !== ownerId) continue;
+    if (!c.telefone) { ignorados.push({ aluno_nome: c.nome, motivo: 'sem telefone' }); continue; }
+    if (!docsParaEnvio(c, competencia, modo)) { ignorados.push({ aluno_nome: c.nome, motivo: competencia ? 'sem guia na competência' : 'sem guia' }); continue; }
+    fila.push(c.id);
   }
-  const ok = resultados.filter((r) => r.status === 'enviado').length;
-  return { alunos: clienteIds.length, total: resultados.length, enviados: ok, falhas: resultados.length - ok, ignorados, resultados };
+  const lote = store.insert('lotes', {
+    owner_id: ownerId, mensagem: body.mensagem || null, competencia, modo,
+    fila, total: fila.length, enviados: 0, falhas: 0, ignorados, resultados: [],
+    min_delay: ritmo.min, max_delay: ritmo.max, ritmo: body.ritmo || 'seguro',
+    status: fila.length ? 'processando' : 'concluido', proximo: Date.now(),
+  });
+  return { lote };
 }
+
+// Processador dos lotes: envia UM cliente por vez, respeitando o delay aleatório.
+const lotesEmProcesso = new Set();
+async function processarLotes() {
+  for (const l of store.where('lotes', (x) => x.status === 'processando')) {
+    if (!l.fila.length) { store.update('lotes', l.id, { status: 'concluido' }); continue; }
+    if (Date.now() < (l.proximo || 0) || lotesEmProcesso.has(l.id)) continue;
+    lotesEmProcesso.add(l.id);
+    const clienteId = l.fila[0];
+    store.update('lotes', l.id, { fila: l.fila.slice(1) }); // avança já, evita reenvio
+    (async () => {
+      let nome = '—', enviados = 0, falhas = 0, statusItem = 'falha';
+      try {
+        const cliente = store.find('clientes', clienteId);
+        if (cliente) {
+          nome = cliente.nome;
+          const docs = docsParaEnvio(cliente, l.competencia, l.modo);
+          if (docs) {
+            const rs = await enviarBoletosDeAluno(cliente, docs, l.mensagem);
+            enviados = rs.filter((x) => x.status === 'enviado').length;
+            falhas = rs.length - enviados;
+            statusItem = enviados > 0 && falhas === 0 ? 'enviado' : (enviados === 0 ? 'falha' : 'pendente');
+          }
+        }
+      } catch { statusItem = 'falha'; falhas = 1; }
+      const cur = store.find('lotes', l.id);
+      if (cur) {
+        store.update('lotes', l.id, {
+          enviados: cur.enviados + enviados,
+          falhas: cur.falhas + falhas,
+          resultados: [...cur.resultados, { aluno_nome: nome, status: statusItem }],
+          status: cur.fila.length ? 'processando' : 'concluido',
+          proximo: Date.now() + cur.min_delay + Math.floor(Math.random() * (cur.max_delay - cur.min_delay)),
+        });
+      }
+      lotesEmProcesso.delete(l.id);
+    })();
+  }
+}
+setInterval(() => { processarLotes().catch(() => {}); }, 3000);
 
 app.post('/api/enviar', async (req, res) => {
   const r = await fazerEnvioIndividual(req.user.id, req.body);
@@ -542,10 +600,17 @@ app.post('/api/enviar', async (req, res) => {
   res.json({ provider: PROVIDER, ...r });
 });
 
-app.post('/api/enviar-massa', async (req, res) => {
-  const r = await fazerEnvioMassa(req.user.id, req.body);
+// Envio em massa: cria o lote (fila) e retorna já; o disparo acontece em segundo plano com delay.
+app.post('/api/enviar-massa', (req, res) => {
+  const r = iniciarLoteMassa(req.user.id, req.body);
   if (r.erro) return err(res, 400, r.erro);
-  res.json({ provider: PROVIDER, ...r });
+  res.status(201).json({ lote_id: r.lote.id, total: r.lote.total, ignorados: r.lote.ignorados });
+});
+
+app.get('/api/lotes/:id', (req, res) => {
+  const l = store.find('lotes', req.params.id);
+  if (!l || l.owner_id !== req.user.id) return err(res, 404, 'Lote não encontrado.');
+  res.json({ id: l.id, status: l.status, total: l.total, enviados: l.enviados, falhas: l.falhas, restantes: l.fila.length, ignorados: l.ignorados, resultados: l.resultados });
 });
 
 // ============================================================== AGENDAMENTOS
@@ -594,9 +659,14 @@ async function processarAgendamentos() {
   for (const a of devidos) {
     store.update('agendamentos', a.id, { status: 'processando' }); // trava contra dupla execução
     try {
-      const r = a.tipo === 'individual'
-        ? await fazerEnvioIndividual(a.owner_id, a.payload)
-        : await fazerEnvioMassa(a.owner_id, a.payload);
+      let r;
+      if (a.tipo === 'individual') {
+        r = await fazerEnvioIndividual(a.owner_id, a.payload);
+      } else {
+        // massa agendada: cria o lote (dispara em segundo plano com delay)
+        const lr = iniciarLoteMassa(a.owner_id, a.payload);
+        r = lr.erro ? { erro: lr.erro } : { enviados: lr.lote.total, falhas: 0 };
+      }
       const falhou = r.erro || (r.enviados === 0 && (r.total || 0) > 0);
       store.update('agendamentos', a.id, {
         status: r.erro ? 'falha' : (falhou ? 'falha' : 'enviado'),

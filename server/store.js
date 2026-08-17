@@ -17,7 +17,8 @@ const EMPTY_DB = {
   documentos: [],
   envios: [],
   agendamentos: [],
-  _seq: { users: 0, sessions: 0, clientes: 0, tipos_documento: 0, tipos_pagamento: 0, documentos: 0, envios: 0, agendamentos: 0 },
+  lotes: [],
+  _seq: { users: 0, sessions: 0, clientes: 0, tipos_documento: 0, tipos_pagamento: 0, documentos: 0, envios: 0, agendamentos: 0, lotes: 0 },
 };
 
 function ensureDb() {
